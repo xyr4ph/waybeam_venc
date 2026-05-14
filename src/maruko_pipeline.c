@@ -21,6 +21,7 @@
 #include "stream_metrics.h"
 #include "venc_api.h"
 #include "venc_httpd.h"
+#include "venc_jpeg.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -67,6 +68,10 @@ static int g_mi_isp_dev_created = 0;
 static int g_mi_scl_dev_created = 0;
 static int g_mi_isp_chn_created = 0;
 static int g_mi_scl_chn_created = 0;
+/* SCL channel 0 port 1 — second tap from the SCL channel for the MJPEG
+ * snapshot backend.  Configured + enabled in configure_maruko_scl, bound
+ * to MJPG VENC dev 8 by venc_jpeg_backend_init (src/maruko_jpeg.c). */
+static int g_mi_scl_port1_enabled = 0;
 
 static int maruko_config_dev_ring_pool(i6c_sys_mod module, MI_U32 device,
 	MI_U16 max_width, MI_U16 max_height, MI_U16 ring_line)
@@ -643,6 +648,52 @@ static int configure_maruko_scl(const SensorSelectResult *sensor,
 	}
 	port = 1;
 
+	/* SCL port 1 — second tap from the same SCL channel, dedicated to
+	 * the MJPEG snapshot backend (src/maruko_jpeg.c).  Same crop and
+	 * output dims as port 0 so snapshots match the live stream framing;
+	 * pixFmt YUV420SP with no IFC compress because the MJPG VENC
+	 * channel reads raw YUV, not IFC-compressed tiles.  Bind happens
+	 * later in venc_jpeg_backend_init via BindChnPort2 FRAMEBASE @
+	 * 5 fps so this port only sees a trickle of frames between
+	 * snapshot requests.
+	 *
+	 * Port-1 failures are non-fatal: we log a warning, leave
+	 * g_mi_scl_port1_enabled=0, and the snapshot endpoint will return
+	 * 503 (venc_jpeg_backend_init() detects no source registered). */
+	if (!g_mi_scl_port1_enabled) {
+		i6c_scl_port scl_port1;
+		memset(&scl_port1, 0, sizeof(scl_port1));
+		if (precrop) {
+			scl_port1.crop.x = precrop->x;
+			scl_port1.crop.y = precrop->y;
+			scl_port1.crop.width = precrop->w;
+			scl_port1.crop.height = precrop->h;
+		}
+		scl_port1.output.width = (unsigned short)out_width;
+		scl_port1.output.height = (unsigned short)out_height;
+		scl_port1.pixFmt = I6_PIXFMT_YUV420SP;
+		scl_port1.compress = 0; /* raw — MJPG VENC won't take IFC */
+		MI_S32 p1_ret = g_mi_scl.fnSetPortConfig(0, 0, 1, &scl_port1);
+		if (p1_ret != 0) {
+			fprintf(stderr,
+				"WARNING: [maruko] SCL port-1 SetPortConfig failed %d "
+				"(snapshot disabled)\n", p1_ret);
+		} else {
+			p1_ret = g_mi_scl.fnEnablePort(0, 0, 1);
+			if (p1_ret != 0) {
+				fprintf(stderr,
+					"WARNING: [maruko] SCL port-1 EnablePort failed %d "
+					"(snapshot disabled)\n", p1_ret);
+			} else {
+				g_mi_scl_port1_enabled = 1;
+				printf("> [maruko] SCL port 1 (snapshot): out(%ux%u) "
+					"fmt=%d compress=%d\n",
+					out_width, out_height,
+					scl_port1.pixFmt, scl_port1.compress);
+			}
+		}
+	}
+
 	if (precrop)
 		venc_api_set_active_precrop(precrop->x, precrop->y,
 			precrop->w, precrop->h);
@@ -1103,7 +1154,7 @@ static int maruko_apply_intra_refresh(MI_VENC_DEV dev, MI_VENC_CHN chn,
 		return 0;
 	}
 	if (!g_mi_venc.fnSetIntraRefresh) {
-		fprintf(stderr, "[venc] WARNING: intraRefreshMode=%s requested "
+		fprintf(stderr, "[waybeam] WARNING: intraRefreshMode=%s requested "
 			"but libmi_venc.so does not export "
 			"MI_VENC_SetIntraRefresh\n", name);
 		pthread_mutex_lock(&g_intra_status_mutex);
@@ -1112,11 +1163,11 @@ static int maruko_apply_intra_refresh(MI_VENC_DEV dev, MI_VENC_CHN chn,
 		return -1;
 	}
 	if (ir.lines_clamped) {
-		fprintf(stderr, "[venc] WARNING: intraRefreshLines exceeds picture "
+		fprintf(stderr, "[waybeam] WARNING: intraRefreshLines exceeds picture "
 			"LCU rows=%u, clamped\n", ir.total_rows);
 	}
 	if (ir.gop_overridden) {
-		fprintf(stderr, "[venc] intra auto-GOP suppressed: explicit "
+		fprintf(stderr, "[waybeam] intra auto-GOP suppressed: explicit "
 			"gopSize=%.2fs\n", snap.explicit_gop_sec);
 	}
 
@@ -1126,7 +1177,7 @@ static int maruko_apply_intra_refresh(MI_VENC_DEV dev, MI_VENC_CHN chn,
 	ir_sdk.u32ReqIQp = ir.req_iqp;
 
 	if (maruko_mi_venc_set_intra_refresh(dev, chn, &ir_sdk) != 0) {
-		fprintf(stderr, "[venc] ERROR: MI_VENC_SetIntraRefresh(dev=%d, "
+		fprintf(stderr, "[waybeam] ERROR: MI_VENC_SetIntraRefresh(dev=%d, "
 			"chn=%d, lines=%u, qp=%u) failed\n", dev, chn,
 			ir_sdk.u32RefreshLineNum, ir_sdk.u32ReqIQp);
 		pthread_mutex_lock(&g_intra_status_mutex);
@@ -1139,7 +1190,7 @@ static int maruko_apply_intra_refresh(MI_VENC_DEV dev, MI_VENC_CHN chn,
 	pthread_mutex_lock(&g_intra_status_mutex);
 	g_intra_status = snap;
 	pthread_mutex_unlock(&g_intra_status_mutex);
-	fprintf(stderr, "[venc] intraRefresh: mode=%s dev=%d chn=%d lines/P=%u "
+	fprintf(stderr, "[waybeam] intraRefresh: mode=%s dev=%d chn=%d lines/P=%u "
 		"qp=%u gop=%.2fs (%s)\n", name, dev, chn, ir_sdk.u32RefreshLineNum,
 		ir_sdk.u32ReqIQp, snap.effective_gop_sec,
 		snap.gop_auto ? "auto" : "explicit");
@@ -1512,6 +1563,10 @@ static void assign_maruko_ports(MarukoBackendContext *ctx,
 		.module = I6_SYS_MOD_SCL, .device = 0,
 		.channel = 0, .port = 0,
 	};
+	ctx->scl_port1 = (MI_SYS_ChnPort_t){
+		.module = I6_SYS_MOD_SCL, .device = 0,
+		.channel = 0, .port = 1,
+	};
 	ctx->venc_port = (MI_SYS_ChnPort_t){
 		.module = I6_SYS_MOD_VENC, .device = venc_device,
 		.channel = ctx->venc_channel, .port = 0,
@@ -1569,6 +1624,27 @@ static int bind_maruko_pipeline(MarukoBackendContext *ctx)
 	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vpe_port, 1, 3);
 	(void)MI_SYS_SetChnOutputPortDepth(&ctx->venc_port, 1, 3);
 
+	/* JPEG snapshot backend on Maruko: dedicated MJPG VENC dev 8 chn 0
+	 * bound to SCL chn 0 port 1 in FRAMEBASE mode (see src/maruko_jpeg.c).
+	 * If SCL port-1 setup failed earlier (warning logged), backend_init
+	 * detects no source registered and returns -ENODEV → snapshot endpoint
+	 * cleanly serves 503.  Config from venc.json snapshot.* section;
+	 * width=0/height=0 inherits main stream dims; quality/channel/enabled
+	 * round-trip through /api/v1/get|set. */
+	if (g_mi_scl_port1_enabled)
+		venc_jpeg_set_source(&ctx->scl_port1);
+	{
+		const VencConfigSnapshot *snap = &ctx->cfg.snapshot;
+		VencJpegConfig jcfg = {
+			.width   = snap->width  ? snap->width  : out_w,
+			.height  = snap->height ? snap->height : out_h,
+			.quality = snap->quality,
+			.channel = snap->channel,
+			.enabled = snap->enabled,
+		};
+		(void)venc_jpeg_init(&jcfg);
+	}
+
 	/* ISP bin: resolve every configure (so SIGHUP / `/api/v1/restart`
 	 * changes to `isp.sensorBin` and the auto-detect fallback are picked
 	 * up on reinit), but skip the actual reload when the resolved path
@@ -1583,7 +1659,25 @@ static int bind_maruko_pipeline(MarukoBackendContext *ctx)
 			ctx->sensor.plane.sensName,
 			isp_bin_resolved, sizeof(isp_bin_resolved)) &&
 		    strcmp(isp_bin_resolved, g_last_isp_bin_path) != 0) {
-			ret = maruko_load_isp_bin(isp_bin_resolved);
+			/* Cold boot vs. SIGHUP reinit dispatch.  The full
+			 * loader runs three vendor hooks: disable_userspace3a
+			 * → load_bin → post_load CUS3A_Enable(0,0,{1,0,0})
+			 * + CUS3A_Enable(0,0,{1,1,0}).  CUS3A_Enable can
+			 * only run once per process lifetime — a second call
+			 * trips "WARNING: Mutex is not initialized before
+			 * lock" inside libmi_isp and segfaults during the
+			 * next IQ access.  The `if (!g_mi_isp_initialized)`
+			 * block below protects the bare maruko_enable_cus3a()
+			 * call, but does NOT cover the post_load hook reached
+			 * via maruko_load_isp_bin.  On reinit the IQ/CUS3A
+			 * framework from the previous lifecycle is still
+			 * resident — we only need to re-load the bin bytes
+			 * (same path the live `isp.sensorBin` reload takes
+			 * via maruko_pipeline_load_isp_bin_live). */
+			if (g_mi_isp_initialized)
+				ret = maruko_load_isp_bin_minimal(isp_bin_resolved);
+			else
+				ret = maruko_load_isp_bin(isp_bin_resolved);
 			if (ret != 0)
 				return -1;
 			snprintf(g_last_isp_bin_path,
@@ -3077,6 +3171,13 @@ void maruko_pipeline_teardown_graph(MarukoBackendContext *ctx)
 		ctx->debug_osd = NULL;
 	}
 	maruko_output_teardown(&ctx->output);
+	/* Tear down JPEG snapshot subsystem first — its MJPG VENC channel
+	 * is bound to the SCL port we're about to disable.  Idempotent. */
+	venc_jpeg_shutdown();
+	if (g_mi_scl_port1_enabled) {
+		(void)g_mi_scl.fnDisablePort(0, 0, 1);
+		g_mi_scl_port1_enabled = 0;
+	}
 	if (ctx->bound_vpe_venc) {
 		(void)MI_SYS_UnBindChnPort(&ctx->vpe_port, &ctx->venc_port);
 		ctx->bound_vpe_venc = 0;
