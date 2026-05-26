@@ -7,11 +7,16 @@
 #define RTP_DEFAULT_PAYLOAD 1400
 #define RTP_BUFFER_MAX 8192
 
+#define RTP_HEADER_SIZE 12
+#define RTP_HEADER_EXT_MAX 16
+
 typedef struct {
 	uint16_t seq;
 	uint32_t timestamp;
 	uint32_t ssrc;
 	uint8_t payload_type;
+	uint8_t ext_data[RTP_HEADER_EXT_MAX];
+	size_t ext_len;
 } RtpPacketizerState;
 
 typedef struct {

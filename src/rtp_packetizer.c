@@ -2,8 +2,6 @@
 
 #include <string.h>
 
-#define RTP_HEADER_SIZE 12
-
 static void rtp_packetizer_reset_result(RtpPacketizerResult *result)
 {
 	if (!result)
@@ -16,12 +14,18 @@ int rtp_packetizer_send_packet(RtpPacketizerState *state,
 	size_t payload1_len, const uint8_t *payload2, size_t payload2_len,
 	int marker)
 {
-	uint8_t header[RTP_HEADER_SIZE];
+	uint8_t header[RTP_HEADER_SIZE + RTP_HEADER_EXT_MAX];
+	size_t header_len = RTP_HEADER_SIZE;
 
 	if (!state || !writer || !payload1 || payload1_len == 0)
 		return -1;
 
 	header[0] = 0x80;
+	if (state->ext_len > 0) {
+		header[0] |= 0x10;
+		memcpy(header + RTP_HEADER_SIZE, state->ext_data, state->ext_len);
+		header_len += state->ext_len;
+	}
 	header[1] = (uint8_t)((marker ? 0x80 : 0x00) |
 		(state->payload_type & 0x7F));
 	header[2] = (uint8_t)((state->seq >> 8) & 0xFF);
@@ -35,7 +39,7 @@ int rtp_packetizer_send_packet(RtpPacketizerState *state,
 	header[10] = (uint8_t)((state->ssrc >> 8) & 0xFF);
 	header[11] = (uint8_t)(state->ssrc & 0xFF);
 
-	if (writer(header, sizeof(header), payload1, payload1_len,
+	if (writer(header, header_len, payload1, payload1_len,
 		payload2, payload2_len, opaque) != 0)
 		return -1;
 

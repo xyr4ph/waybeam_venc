@@ -18,6 +18,8 @@ extern "C" {
 #endif
 
 uint64_t wb_monotonic_us(void);
+uint64_t wb_utc_offset_us(void);
+uint64_t wb_monotonic_to_utc_us(uint64_t mono_us);
 
 #ifdef __cplusplus
 }

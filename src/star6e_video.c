@@ -110,19 +110,41 @@ size_t star6e_video_send_frame(Star6eVideoState *state,
 		uint32_t frame_rtp_ts = 0;
 		uint16_t seq_before = 0;
 		uint64_t ready_us = 0;
-		uint64_t capture_us = 0;
+		uint64_t capture_us = (stream->count > 0 && stream->packet)
+			? stream->packet[0].timestamp : 0;
+
+		/* ---- RTP Absolute Timestamp Extension ---- */
+		{
+			uint64_t abs_ts_us = wb_monotonic_to_utc_us(capture_us);
+			state->rtp_state.ext_len = 12;
+			/* RFC 3550 profile-specific extension header */
+			state->rtp_state.ext_data[0] = 0xAB; /* profile ID high */
+			state->rtp_state.ext_data[1] = 0xAC; /* profile ID low  */
+			state->rtp_state.ext_data[2] = 0x00; /* length = 2 words */
+			state->rtp_state.ext_data[3] = 0x02;
+			/* 64-bit absolute timestamp, big-endian */
+			state->rtp_state.ext_data[4] = (uint8_t)((abs_ts_us >> 56) & 0xFF);
+			state->rtp_state.ext_data[5] = (uint8_t)((abs_ts_us >> 48) & 0xFF);
+			state->rtp_state.ext_data[6] = (uint8_t)((abs_ts_us >> 40) & 0xFF);
+			state->rtp_state.ext_data[7] = (uint8_t)((abs_ts_us >> 32) & 0xFF);
+			state->rtp_state.ext_data[8] = (uint8_t)((abs_ts_us >> 24) & 0xFF);
+			state->rtp_state.ext_data[9] = (uint8_t)((abs_ts_us >> 16) & 0xFF);
+			state->rtp_state.ext_data[10] = (uint8_t)((abs_ts_us >> 8) & 0xFF);
+			state->rtp_state.ext_data[11] = (uint8_t)(abs_ts_us & 0xFF);
+		}
+		/* ------------------------------------------ */
 
 		if (sidecar_active) {
 			rtp_sidecar_poll(&state->sidecar);
 			frame_rtp_ts = state->rtp_state.timestamp;
 			seq_before = state->rtp_state.seq;
 			ready_us = wb_monotonic_us();
-			capture_us = (stream->count > 0 && stream->packet)
-				? stream->packet[0].timestamp : 0;
 		}
 
 		total_bytes = star6e_output_send_frame(output, stream,
 			state->max_frame_size, send_frame_output_rtp, &rtp_frame);
+		
+		state->rtp_state.ext_len = 0; /* clear so non-frame packets don't carry it */
 
 		if (sidecar_active) {
 			RtpSidecarTransportInfo tinfo;
